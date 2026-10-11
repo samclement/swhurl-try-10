@@ -13,6 +13,20 @@ An HTTP service: `src/server.ts` answers on port 8080; the platform probes `GET 
 - **Who is calling.** `identify(request.headers)` returns `{ type: "app", id: "<app>" }` for another app that sent a token the platform issued for this app alone, `{ type: "user", id: "<email>" }` for a signed-in person, or `anonymous`. A bad token throws `Unauthorized`, which `src/server.ts` answers with 401. Every log line and span carries `caller.type` and `caller.id`. For a route only apps may use, call `requireApp(caller)`.
 - **Calling another app.** Add `calls: [orders]` to `swhurl.yaml` before the app is created (afterwards: `make app-calls` on the platform, or the app page's **Calls** form). Then `await service("orders").fetch("/path")` reaches the same environment's `orders` with this app's token for it; the callee's spans join the same trace. `GET /call/orders` in `src/server.ts` is an example to replace.
 
+## Events
+
+`src/events.ts` publishes and receives events on the platform's NATS ([events](https://github.com/samclement/swhurl-platform/blob/main/docs/apps.md#events)). Declare them in `swhurl.yaml` before the app is created (afterwards: `make app-events` on the platform):
+
+```yaml
+events:
+  publish: [created]               # other apps see swhurl-try-10.created
+  subscribe: [orders.created]      # <app>.<event>
+```
+
+Then `await publish("created", data)` and `await subscribe("orders.created", async (event) => { ... })`. An event is a CloudEvents envelope (`event.data` is what was published); a handler runs inside the publisher's trace, and if it throws the event comes back, five tries in all. `src/server.ts` publishes the first declared event on every request and logs every event it subscribes to: examples to replace. Locally there is no NATS: `publish` returns `null` and `subscribe` never calls back.
+
+## Without the platform
+
 Locally there are no platform keys or tokens: requests without a token work as before and a request with one is refused; to call another app, set `SWHURL_SERVICE_<NAME>_URL` to a local stub.
 
 ## Local development

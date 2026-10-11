@@ -2,6 +2,7 @@ import http from "node:http";
 import { trace } from "@opentelemetry/api";
 import pino from "pino";
 import { openDatabase } from "./db.js";
+import { closeEvents, declaredPublishes, declaredSubscriptions, publish, subscribe } from "./events.js";
 import { type Caller, Unauthorized, identify, service } from "./platform.js";
 
 const logger = pino({
@@ -85,12 +86,25 @@ async function handle(request: http.IncomingMessage, response: http.ServerRespon
   recordVisit.run(url.pathname, new Date().toISOString());
   const visits = Number((countVisits.get() as { n: number }).n);
 
+  // An example of publishing: the first event this app declares (events.publish in swhurl.yaml)
+  // goes out on every request. Off the platform, or with nothing declared, nothing happens.
+  const [declared] = declaredPublishes();
+  let eventId: string | null = null;
+  if (declared) {
+    try {
+      eventId = (await publish(declared, { path: url.pathname, caller }))?.id ?? null;
+    } catch (error) {
+      logger.error({ err: error, event: declared, trace_id: traceId }, "event not published");
+    }
+  }
+
   const body = {
     message: `hello from ${serviceName}`,
     service: serviceName,
     path: url.pathname,
     caller,
     visits,
+    event: eventId ? { type: `${serviceName}.${declared}`, id: eventId } : null,
     traceId,
   };
 
@@ -103,10 +117,18 @@ server.listen(port, "0.0.0.0", () => {
   logger.info({ port, service: serviceName }, "server listening");
 });
 
+// An example of receiving: log every event this app declared it subscribes to (events.subscribe).
+for (const name of declaredSubscriptions()) {
+  subscribe(name, (event) => {
+    logger.info({ event_type: event.type, event_id: event.id, source: event.source,
+      trace_id: trace.getActiveSpan()?.spanContext().traceId ?? null }, "event received");
+  }).catch((error: unknown) => logger.error({ err: error, subscription: name }, "cannot subscribe"));
+}
+
 // Kubernetes sends SIGTERM before stopping the pod: finish open requests, then exit.
 process.on("SIGTERM", () => {
   server.close(() => {
     db.close();
-    process.exit(0);
+    void closeEvents().finally(() => process.exit(0));
   });
 });

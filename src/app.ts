@@ -4,6 +4,7 @@ import { trace } from "@opentelemetry/api";
 import pino from "pino";
 import { openDatabase } from "./db.js";
 import { publish } from "./events.js";
+import { flags, flagsLoaded } from "./flags.js";
 import { type Caller, Unauthorized, identify, notify, service } from "./platform.js";
 
 export const logger = pino({
@@ -11,6 +12,12 @@ export const logger = pino({
 });
 
 const serviceName = process.env.OTEL_SERVICE_NAME ?? "swhurl-app";
+// Who this app is, as the platform names and describes it (SWHURL_APP; SWHURL_DESCRIPTION, from
+// swhurl.yaml), or as it was created off the platform: an image built for another app says the right thing.
+const identity = () => ({
+  name: process.env.SWHURL_APP || "swhurl-try-10",
+  description: process.env.SWHURL_DESCRIPTION || "throwaway: team platform T2 callee (orders), delete me",
+});
 // DATABASE_PATH comes from the platform (a file on a volume that outlives the pod); app.db locally.
 export const db = openDatabase();
 const recordVisit = db.prepare("INSERT INTO events (kind, detail, at) VALUES ('visit', ?, ?)");
@@ -24,8 +31,10 @@ app.onError((error, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
-// What the platform probes: no caller check, no log line.
+// What the platform probes: no caller check, no log line. Not ready until the app's feature flag
+// overrides have arrived (at most 5 s; src/flagstore.ts).
 app.get("/healthz", (c) => {
+  if (!flagsLoaded()) return c.json({ ok: false, waiting: "feature flag overrides" }, 503);
   db.prepare("SELECT 1").get(); // ready only when the database answers
   return c.json({ ok: true });
 });
@@ -47,6 +56,8 @@ app.use(async (c, next) => {
   const span = trace.getActiveSpan();
   span?.setAttribute("caller.type", caller.type);
   if (caller.id) span?.setAttribute("caller.id", caller.id);
+  const person = caller.type === "app" ? caller.user : undefined;
+  if (person) span?.setAttribute("user.email", person);
   await next();
   logger.info({
     method: c.req.method,
@@ -55,16 +66,18 @@ app.use(async (c, next) => {
     duration_ms: Date.now() - start,
     "caller.type": caller.type,
     "caller.id": caller.id,
+    ...(person ? { "user.email": person } : {}),
     trace_id: traceId(),
   }, "request handled");
 });
 
 // An example of calling another app: GET /call/orders asks the app "orders" for its "/" and
-// returns what it said. It works once this app declares the call (calls: [orders] in swhurl.yaml).
+// returns what it said. It works once the platform grants this app the call (make app-calls).
+// onBehalfOf tells orders who is signed in here, so its "/" names this app and that person.
 app.get("/call/:name", async (c) => {
   const name = c.req.param("name");
   try {
-    const reply = await service(name).fetch("/");
+    const reply = await service(name).fetch("/", { onBehalfOf: c.get("caller") });
     return c.json({ called: name, status: reply.status, reply: await reply.json().catch(() => null) }, reply.ok ? 200 : 502);
   } catch (error) {
     return c.json({ called: name, error: (error as Error).message }, 502);
@@ -94,8 +107,11 @@ async function hello(caller: Caller) {
       logger.error({ err: error, event: published, trace_id: traceId() }, "event not published");
     }
   }
+  // An example of a feature flag: shout is declared in swhurl.yaml, on in staging only.
+  const greeting = `hello from ${serviceName}`;
+  const message = flags.shout ? greeting.toUpperCase() : greeting;
   return {
-    message: `hello from ${serviceName}`,
+    message,
     service: serviceName,
     caller,
     visits,
@@ -107,9 +123,13 @@ async function hello(caller: Caller) {
 // A described route: the schemas below are what the handler must return and what openapi.json says.
 // Add routes the same way and run `npm run openapi`; CI fails if openapi.json is out of date.
 const Hello = z.object({
-  message: z.string().openapi({ example: "hello from swhurl-try-10" }),
+  message: z.string().openapi({ example: `hello from ${identity().name}` }),
   service: z.string(),
-  caller: z.object({ type: z.enum(["app", "user", "anonymous"]), id: z.string().nullable() }),
+  caller: z.object({
+    type: z.enum(["app", "user", "anonymous"]),
+    id: z.string().nullable(),
+    user: z.string().optional().openapi({ description: "For an app: the signed-in person it is calling for" }),
+  }),
   visits: z.number().int().optional().openapi({ description: "How many times it was asked, when the app keeps a database" }),
   event: z.object({ type: z.string(), id: z.string() }).nullable().openapi({ description: "The event this request published, if any" }),
   traceId: z.string().nullable(),
@@ -128,7 +148,7 @@ app.openapi(
 /** What this app offers other apps: generated from the routes above, served and kept in openapi.json. */
 export const openapi = () => app.getOpenAPI31Document({
   openapi: "3.1.0",
-  info: { title: "swhurl-try-10", version: "0.1.0", description: "throwaway: team platform T2 callee (orders), delete me" },
+  info: { title: identity().name, version: "0.1.0", description: identity().description },
 });
 app.get("/openapi.json", (c) => c.json(openapi()));
 
